@@ -1,0 +1,83 @@
+<style>
+  body {
+    margin: 0;
+    overflow: hidden;
+  }
+
+  canvas#matrixCanvas {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 9999;
+    background: black;
+    pointer-events: none;
+  }
+
+  .hacked-message {
+    position: fixed;
+    top: 40%;
+    width: 100%;
+    text-align: center;
+    font-family: 'Courier New', monospace;
+    font-size: 80px;
+    color: red;
+    z-index: 10000;
+    text-shadow: 0 0 20px red, 0 0 50px white;
+    animation: blink 0.1s infinite alternate, rotate 0.3s infinite linear;
+  }
+
+  @keyframes blink {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+
+  @keyframes rotate {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(1deg); }
+  }
+</style>
+
+<canvas id="matrixCanvas"></canvas>
+<div class="hacked-message">MACHINE HACKED!!!</div>
+
+<script>
+  const canvas = document.getElementById("matrixCanvas");
+  const ctx = canvas.getContext("2d");
+
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+
+  const letters = "01ABCDEFGHIJKLMNOPQRSTUVXYZ#$%&@*";
+  const fontSize = 14;
+  const columns = canvas.width / fontSize;
+  const drops = Array(Math.floor(columns)).fill(1);
+
+  function drawMatrix() {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.05)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = "#0F0";
+    ctx.font = fontSize + "px monospace";
+
+    for (let i = 0; i < drops.length; i++) {
+      const text = letters[Math.floor(Math.random() * letters.length)];
+      ctx.fillText(text, i * fontSize, drops[i] * fontSize);
+
+      if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
+        drops[i] = 0;
+      }
+
+      drops[i]++;
+    }
+  }
+
+  setInterval(drawMatrix, 33);
+
+  // Optional: Blinking color chaos for more "hacked" flair
+  setInterval(() => {
+    const msg = document.querySelector(".hacked-message");
+    msg.style.color = ["red", "lime", "white", "#0FF", "#F0F"][Math.floor(Math.random() * 5)];
+    msg.style.textShadow = `0 0 20px ${msg.style.color}, 0 0 60px white`;
+    msg.style.transform = `scale(${1 + Math.random() * 0.5}) rotate(${Math.random() * 20 - 10}deg)`;
+  }, 100);
+</script>
