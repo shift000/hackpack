@@ -1,4 +1,4 @@
-import sys
+import sys, base64
 
 file = sys.argv[1]
 
@@ -68,6 +68,15 @@ def write_part(cp):
         print(f'Error while writing part: {e}!')
         return -1
 
+
+def decode_base64(a, encoding):
+    encoding = str(encoding, 'utf-8')
+    missing_padding = len(a) % 4
+    if missing_padding:
+        a += b'=' * (4 - missing_padding)
+    return base64.b64decode(str(a, 'utf-8').encode(encoding)).decode(encoding)
+
+
 # STEP 1 : EXTRACT BASE64 ENCODED PARTS FROM EML FILE
 with open(file, 'r') as f:
     l_found = False
@@ -98,7 +107,7 @@ with open(file, 'r') as f:
                             if lx_val[-1] == ';':
                                 lx_val = lx_val[:-1]
                             current_found_content.set_property(key, lx_val)
-                            print(f'[+] Found {key} in {lx_key.lower()}')
+                            print(f'[+] Found key[{key}]> {lx_val.lower()}')
 
                 # Value
                 elif line[0] == '\t':
@@ -117,22 +126,53 @@ with open(file, 'r') as f:
                     for key in current_found_content.properties.keys():
                         if key in lx_key.lower():
                             current_found_content.set_property(key, lx_val)
+                            print(f'  [+] Found subkey[{key}]> {lx_val.lower()}')
                 else:
                     current_found_content.add_data(line)
-
-print(f"created {conf['parts']} parts for {conf['file']}".replace('\n', ''))
-exit()
+    print('\n')
 
 # STEP 2 : PARSE AND "REPAIR" PARTS AND OUTPUT THEM AS SINGLE FILES - FILETYPE AS DEFINED IN HEADER
-file_out = ''
+types_to_parse = [e for e in ('application', 'image')]
 
-with open(file, 'rb') as f:
-    for line in f.readlines():
-        for char in line:
-            #'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!"§$%&/()=?#\'+-/*~\\}][{³²^°<>|_.:,;äÄöÖüÜ´`'
-            if char in [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 33, 34, 167, 36, 37, 38, 47, 40, 41, 61, 63, 35, 39, 43, 45, 47, 42, 126, 92, 125, 93, 91, 123, 179, 178, 94, 176, 60, 62, 124, 95, 46, 58, 44, 59, 228, 196, 246, 214, 252, 220, 180, 96]:
-                file_out += ord(char)
-with open(f'{file}_cleaned', 'w+') as f:
-    f.write(file_out)
+for part_no in range(conf['parts']):
+    part_data = {
+        'name':     'None',
+        'encoding': 'None',
+        'type':     'None',
+        'charset':  'None',
+        'disposition': 'None',
+        'data':     '',
+        'skipped':  False
+    }
+    with open(f'{conf["file"]}_{part_no}', 'rb') as f:
+        for i, line in enumerate(f.readlines()):
+            line = line.replace(bytes('\n', 'utf-8'), b'')
+            if i==0: # first line with block information
+                header                  = line.split(b'|')
+                part_data['name']       = header[0]
+                part_data['encoding']   = header[1]
+                part_data['type']       = header[2]
+                part_data['charset']    = header[3]
+                part_data['dispostion'] = header[4]
 
-print('successfully repaired file...')
+                if str(part_data["type"].split(b"/")[0], "utf-8") in types_to_parse:
+                    if part_data['charset'] == b'utf-8':
+                        part_data['name'] = decode_base64(part_data['name'].replace(b'?UTF-8?B?', b'')[:-1], part_data['charset'])
+
+                else:
+                    print('No attachment - skipping..')
+                    part_data['skipped'] = True
+                    break
+
+                # skip first line, should not be in file
+                continue
+            for char in line:
+                #'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!"§$%&/()=?#\'+-/*~\\}][{³²^°<>|_.:,;äÄöÖüÜ´`'
+                if char in [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 33, 34, 167, 36, 37, 38, 47, 40, 41, 61, 63, 35, 39, 43, 45, 47, 42, 126, 92, 125, 93, 91, 123, 179, 178, 94, 176, 60, 62, 124, 95, 46, 58, 44, 59, 228, 196, 246, 214, 252, 220, 180, 96]:
+                    part_data['data'] += chr(char)
+    
+        if not part_data['skipped']:
+            cleaned_file_name = f'{conf["file"]}_{part_no}_{str(part_data["type"].split(b"/")[0], "utf-8")}'
+            with open(f'{cleaned_file_name}', 'w+') as f:
+                f.write(part_data['data'])
+            print(f'cleaned attachment file {cleaned_file_name}')
