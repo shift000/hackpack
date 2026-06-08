@@ -44,6 +44,15 @@ except ImportError:
     HAS_PYZIPPER = False
     import zipfile
 
+try:
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+    HAS_FPDF = True
+except ImportError:
+    HAS_FPDF = False
+    XPos = None
+    YPos = None
+
 ################################################################################
 # ANSI / TUI STYLING
 ################################################################################
@@ -169,6 +178,8 @@ MAGIC_SIGNATURES = {
     b"\x1f\x9d":                      "tar_z",
     b"\x1f\xa0":                      "tar_z",
     b"Rar!":                          "rar",
+    b"-lzh-":                         "lha",
+    b"\x60\xea":                      "arj",
     b"7z\xbc\xaf\x27\x1c":           "7z",
     b"\x00\x00\x00\x18\x66\x74\x79\x70": "mp4",
     b"\x00\x00\x00\x1c\x66\x74\x79\x70": "mp4",
@@ -258,6 +269,64 @@ def _check_ooxml_type(data: bytes) -> str:
         return "zip"
     except Exception:
         return "zip"
+
+################################################################################
+# NESTED ARCHIVE SCANNING
+################################################################################
+
+# Archive types that might contain embedded executables
+ARCHIVE_TYPES = {"zip", "rar", "7z", "lha", "lzh", "arj", "cab", "tar", "gz", "bz2"}
+
+# Inner type patterns to detect in archive headers
+INNER_PATTERNS = [
+    (b"MZ", "exe (PE executable)"),
+    (b"\x7fELF", "elf (ELF executable)"),
+    (b"\xca\xfe\xba\xbe", "class (Java class)"),
+    (b"Rar!", "rar archive"),
+    (b"PK\x03\x04", "zip archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7z archive"),
+    (b"\x1f\x8b", "gzip archive"),
+    (b"\x1f\xa0", "lha/lzh archive"),
+    (b"-lzh-", "lha/lzh archive"),
+    (b"\x60\xea", "arj archive"),
+    (b"MSCF", "cab archive"),
+    (b"%PDF", "pdf document"),
+    (b"<!DOCTYPE", "html document"),
+    (b"<html", "html document"),
+]
+
+def _scan_archive_for_inner_content(data: bytes, filename: str) -> list[str]:
+    """Scan archive content for embedded file types.
+    Returns list of detected inner types/reasons."""
+    reasons = []
+
+    # Scan for known executable signatures within the archive data
+    for magic, description in INNER_PATTERNS:
+        offset = 0
+        while True:
+            pos = data.find(magic, offset)
+            if pos == -1:
+                break
+            reasons.append(f"inner: {description} at offset {pos}")
+            offset = pos + 1
+            # Only find first few occurrences to avoid noise
+            if len(reasons) > 10:
+                break
+
+    # Log if no known inner content found (for enhancement purposes)
+    if not reasons:
+        log("debug", f"Archive {filename}: no known inner content detected, "
+                     f"size={len(data)}, first_bytes={data[:64].hex()}")
+
+    return reasons
+
+def _log_unknown_type(data: bytes, filename: str, detected_type: str):
+    """Log unknown/uncommon file types for future enhancement."""
+    # Only log if truly unknown
+    if detected_type in ("bin", "???") or detected_type not in MAGIC_SIGNATURES.values():
+        first_bytes = data[:128].hex() if len(data) >= 128 else data.hex()
+        log("info", f"[UNKNOWN_TYPE] filename={filename} detected_type={detected_type} "
+                    f"size={len(data)} first_bytes={first_bytes}")
 
 ################################################################################
 # CONTENT-BASED RATING
@@ -581,6 +650,19 @@ def rate_file_content(data: bytes, filename: str, detected_type: str) -> tuple[i
     if magic_type in ("exe", "elf", "dll", "macho"):
         is_executable = True
         score_delta += -35
+
+    # Check for archives and scan for inner content
+    if detected_type in ARCHIVE_TYPES or ext in ARCHIVE_TYPES:
+        inner_reasons = _scan_archive_for_inner_content(data, filename)
+        if inner_reasons:
+            reasons.extend(inner_reasons)
+            # If inner exe found, mark as executable
+            if any("exe" in r.lower() for r in inner_reasons):
+                is_executable = True
+                score_delta += -30  # Heavy penalty for archive containing exe
+
+    # Log unknown types for enhancement
+    _log_unknown_type(data, filename, detected_type)
 
     # Content-based scanning
     try:
@@ -1139,6 +1221,308 @@ def display_mail_summary(eml_files: list):
         print()
 
 ################################################################################
+# PDF EXPORT
+################################################################################
+
+def export_full_report(session, urls: list) -> str:
+    """Export full analysis report as PDF."""
+    if not HAS_FPDF:
+        # Fallback to text file
+        return export_full_report_text(session, urls)
+
+    archive_name = os.path.basename(session.archive_path)
+    report_name = f"analysis_report_{archive_name.replace('.zip', '')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    report_path = os.path.join(session.extract_dir, report_name)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Quarantine Helper - Analysis Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Archive: {archive_name}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+    pdf.cell(0, 6, f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+    pdf.ln(8)
+
+    # Collect all files
+    all_files = []
+    for key, entries in session.stats.items():
+        if key.startswith("__errors__"):
+            continue
+        for e in entries:
+            if isinstance(e, dict):
+                if key == "__defused__":
+                    e["dangerous"] = True
+                all_files.append(e)
+
+    # ========== MAIL HEADER SUMMARY ==========
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_fill_color(200, 200, 200)
+    pdf.cell(0, 8, "1. Mail Header Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
+    pdf.ln(3)
+
+    if session.eml_files:
+        for eml in session.eml_files:
+            headers = extract_mail_headers(eml)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 6, os.path.basename(eml), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("Courier", "", 8)
+
+            for key in _INTERESTING_HEADERS:
+                val = headers.get(key)
+                if val:
+                    display = val if len(val) < 80 else val[:77] + "..."
+                    pdf.cell(0, 4, f"  {key:<20}: {display}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            # SPF verdict
+            spf = headers.get("received-spf", "").lower()
+            if "pass" in spf:
+                pdf.set_text_color(0, 128, 0)
+                pdf.cell(0, 4, "  SPF: PASS", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            elif "fail" in spf:
+                pdf.set_text_color(255, 0, 0)
+                pdf.cell(0, 4, "  SPF: FAIL - potential spoofing", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(3)
+    else:
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 5, "  No EML files found.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.ln(5)
+
+    # ========== FILE REPORT ==========
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "2. Extracted Files", new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
+    pdf.ln(3)
+
+    safe_files = [f for f in all_files if not f.get("dangerous")]
+    defused_files = [f for f in all_files if f.get("dangerous")]
+
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(0, 5, f"Summary: {len(safe_files)} safe | {len(defused_files)} defused", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(3)
+
+    # Table header
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(80, 5, "Filename", border=1, fill=True)
+    pdf.cell(20, 5, "Type", border=1, fill=True)
+    pdf.cell(15, 5, "Rating", border=1, fill=True)
+    pdf.cell(25, 5, "Status", border=1, fill=True)
+    pdf.cell(25, 5, "Size", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # Safe files
+    pdf.set_font("Courier", "", 7)
+    for f in safe_files:
+        rating = f.get("rating", 50)
+        ext = f.get("detected_type", f.get("extension", "bin").lstrip("."))
+        size = f.get("size", 0)
+        fname = f["filename"][:45]
+        pdf.cell(80, 4, fname, border=1)
+        pdf.cell(20, 4, ext, border=1)
+        pdf.set_text_color(0, 100, 0)
+        pdf.cell(15, 4, f"{rating}/100", border=1)
+        pdf.set_text_color(0, 128, 0)
+        pdf.cell(25, 4, "safe", border=1)
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(25, 4, f"{size:,} B", border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # Defused files
+    for f in defused_files:
+        rating = f.get("rating", 50)
+        ext = f.get("detected_type", f.get("extension", "bin").lstrip("."))
+        size = f.get("size", 0)
+        fname = f["filename"][:45]
+        reasons = f.get("reasons", [])
+        pdf.cell(80, 4, fname, border=1)
+        pdf.cell(20, 4, ext, border=1)
+        pdf.set_text_color(200, 0, 0)
+        pdf.cell(15, 4, f"{rating}/100", border=1)
+        pdf.set_text_color(255, 0, 0)
+        pdf.cell(25, 4, "DEFUSED", border=1)
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(25, 4, f"{size:,} B", border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        # Show reasons in next row (use multi_cell for text wrapping)
+        if reasons:
+            pdf.set_font("Helvetica", "I", 6)
+            all_reasons = ", ".join(reasons)
+            pdf.multi_cell(0, 3, f"    -> {all_reasons}")
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(5)
+
+    # ========== HASH REPORT ==========
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "3. File Hashes (MD5 / SHA256)", new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
+    pdf.ln(3)
+
+    pdf.set_font("Courier", "", 7)
+    for f in all_files:
+        dangerous = f.get("dangerous", False)
+        if dangerous:
+            pdf.set_text_color(200, 0, 0)
+        pdf.cell(0, 4, f["filename"], new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_text_color(100, 100, 100)
+        pdf.cell(0, 3, f"  MD5:    {f.get('md5', 'N/A')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 3, f"  SHA256: {f.get('sha256', 'N/A')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+    pdf.ln(3)
+
+    # ========== EXTRACTED URLs ==========
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "4. Extracted URLs", new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
+    pdf.ln(3)
+
+    if urls:
+        high = [u for u in urls if u["score"] >= 6]
+        med = [u for u in urls if 3 <= u["score"] < 6]
+        low = [u for u in urls if u["score"] < 3]
+
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 5, f"Total: {len(urls)} URLs ({len(high)} HIGH, {len(med)} MED, {len(low)} LOW)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
+
+        for u in urls:
+            score = u["score"]
+            if score >= 6:
+                pdf.set_text_color(200, 0, 0)
+                label = "HIGH"
+            elif score >= 3:
+                pdf.set_text_color(180, 120, 0)
+                label = "MED"
+            else:
+                pdf.set_text_color(0, 100, 0)
+                label = "LOW"
+
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.cell(0, 4, f"[{label}] score={score}/10", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("Courier", "", 7)
+            pdf.multi_cell(0, 3, f"  {u['url']}")
+            if u.get("reasons"):
+                pdf.set_text_color(100, 100, 100)
+                pdf.set_font("Helvetica", "I", 6)
+                pdf.multi_cell(0, 3, f"  ({', '.join(u['reasons'])})")
+            pdf.set_text_color(0, 0, 0)
+    else:
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 5, "  No URLs found.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.output(report_path)
+    log("info", f"PDF report exported: {report_path}")
+    return report_path
+
+def export_full_report_text(session, urls: list) -> str:
+    """Fallback text export if fpdf is not available."""
+    archive_name = os.path.basename(session.archive_path)
+    report_name = f"analysis_report_{archive_name.replace('.zip', '')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    report_path = os.path.join(session.extract_dir, report_name)
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append("QUARANTINE HELPER - ANALYSIS REPORT")
+    lines.append("=" * 70)
+    lines.append(f"Archive: {archive_name}")
+    lines.append(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+
+    # Collect all files
+    all_files = []
+    for key, entries in session.stats.items():
+        if key.startswith("__errors__"):
+            continue
+        for e in entries:
+            if isinstance(e, dict):
+                if key == "__defused__":
+                    e["dangerous"] = True
+                all_files.append(e)
+
+    # MAIL HEADER SUMMARY
+    lines.append("-" * 70)
+    lines.append("1. MAIL HEADER SUMMARY")
+    lines.append("-" * 70)
+
+    if session.eml_files:
+        for eml in session.eml_files:
+            headers = extract_mail_headers(eml)
+            lines.append(f"File: {os.path.basename(eml)}")
+            for key in _INTERESTING_HEADERS:
+                val = headers.get(key)
+                if val:
+                    lines.append(f"  {key:<20}: {val}")
+            spf = headers.get("received-spf", "").lower()
+            if "pass" in spf:
+                lines.append("  SPF: PASS")
+            elif "fail" in spf:
+                lines.append("  SPF: FAIL - potential spoofing")
+            lines.append("")
+    else:
+        lines.append("  No EML files found.")
+
+    # FILE REPORT
+    lines.append("")
+    lines.append("-" * 70)
+    lines.append("2. EXTRACTED FILES")
+    lines.append("-" * 70)
+
+    safe_files = [f for f in all_files if not f.get("dangerous")]
+    defused_files = [f for f in all_files if f.get("dangerous")]
+    lines.append(f"Summary: {len(safe_files)} safe | {len(defused_files)} defused")
+    lines.append("")
+
+    lines.append(f"{'Filename':<50} {'Type':<10} {'Rating':<10} {'Status':<10} {'Size':>12}")
+    lines.append("-" * 100)
+
+    for f in all_files:
+        rating = f.get("rating", 50)
+        ext = f.get("detected_type", f.get("extension", "bin").lstrip("."))
+        size = f.get("size", 0)
+        status = "DEFUSED" if f.get("dangerous") else "safe"
+        reasons = f.get("reasons", [])
+        lines.append(f"{f['filename']:<50} {ext:<10} {rating}/100   {status:<10} {size:>12,} B")
+        if reasons:
+            lines.append(f"  -> {', '.join(reasons)}")
+
+    # HASH REPORT
+    lines.append("")
+    lines.append("-" * 70)
+    lines.append("3. FILE HASHES")
+    lines.append("-" * 70)
+
+    for f in all_files:
+        lines.append(f"{f['filename']}")
+        lines.append(f"  MD5:    {f.get('md5', 'N/A')}")
+        lines.append(f"  SHA256: {f.get('sha256', 'N/A')}")
+        lines.append("")
+
+    # URLS
+    lines.append("")
+    lines.append("-" * 70)
+    lines.append("4. EXTRACTED URLs")
+    lines.append("-" * 70)
+
+    if urls:
+        for u in urls:
+            score = u["score"]
+            label = "HIGH" if score >= 6 else ("MED" if score >= 3 else "LOW")
+            lines.append(f"[{label}] score={score}/10")
+            lines.append(f"  {u['url']}")
+            if u.get("reasons"):
+                lines.append(f"  ({', '.join(u['reasons'])})")
+            lines.append("")
+    else:
+        lines.append("  No URLs found.")
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    log("info", f"Text report exported: {report_path}")
+    return report_path
+
+################################################################################
 # MAIN MENU
 ################################################################################
 
@@ -1230,9 +1614,9 @@ def decode_and_write_part(cp: ContentPart, out_dir: str, idx: int, stats: dict):
         if dangerous:
             target_dir = os.path.join(out_dir, "defused")
             os.makedirs(target_dir, exist_ok=True)
-            # Add _defused suffix to extension
+            # Add _defused suffix after extension
             base, ext = os.path.splitext(safe_name)
-            final_name = f"{base}_defused{ext}"
+            final_name = f"{base}{ext}_defused"
             stat_key = "__defused__"
         else:
             target_dir = out_dir
@@ -1660,6 +2044,7 @@ def main():
                     print(clr("  [1]", C_CYAN, BOLD) + " Show URLs found")
                     print(clr("  [2]", C_CYAN, BOLD) + " Show Hash Report")
                     print(clr("  [3]", C_CYAN, BOLD) + " Show Mail Header Summary")
+                    print(clr("  [P]", C_GREEN, BOLD) + " Export PDF Report (full)")
                     print(clr("  [0]", C_GRAY, BOLD) + " Continue to cleanup")
                     print()
 
@@ -1679,6 +2064,17 @@ def main():
                     elif choice == "3":
                         banner()
                         display_mail_summary(sess.eml_files)
+                        press_enter()
+                    elif choice.lower() == "p":
+                        banner()
+                        section("PDF Report Export")
+                        decoded_dir = os.path.join(sess.extract_dir, "decoded")
+                        urls = extract_urls_from_decoded(decoded_dir)
+                        try:
+                            pdf_path = export_full_report(sess, urls)
+                            ok(f"PDF Report saved: {pdf_path}")
+                        except Exception as e:
+                            err(f"PDF export failed: {e}")
                         press_enter()
                     elif choice == "0":
                         break
