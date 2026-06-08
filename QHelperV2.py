@@ -275,7 +275,7 @@ def _check_ooxml_type(data: bytes) -> str:
 ################################################################################
 
 # Archive types that might contain embedded executables
-ARCHIVE_TYPES = {"zip", "rar", "7z", "lha", "lzh", "arj", "cab", "tar", "gz", "bz2"}
+ARCHIVE_TYPES = {"zip", "rar", "7z", "lha", "lzh", "arj", "cab", "tar", "gz", "bz2", "docx", "xlsx", "pptx"}
 
 # Inner type patterns to detect in archive headers
 INNER_PATTERNS = [
@@ -319,6 +319,74 @@ def _scan_archive_for_inner_content(data: bytes, filename: str) -> list[str]:
                      f"size={len(data)}, first_bytes={data[:64].hex()}")
 
     return reasons
+
+
+def _check_zip_entry_paths(archive_path_or_data) -> list[dict]:
+    """Check ZIP entries for suspicious paths and dangerous extensions.
+    Accepts either a file path (str) or bytes data.
+    Returns list of suspicious entries with reasons."""
+    import zipfile
+    from io import BytesIO
+    suspicious = []
+
+    try:
+        if isinstance(archive_path_or_data, bytes):
+            zf_source = BytesIO(archive_path_or_data)
+        else:
+            zf_source = archive_path_or_data
+
+        with zipfile.ZipFile(zf_source, "r") as zf:
+            for entry in zf.infolist():
+                name = entry.filename
+                if not name or name.endswith("/"):
+                    continue  # Skip directories
+
+                # Get the file extension from the entry name (keep the dot for set lookups)
+                _, ext = os.path.splitext(name)
+                ext_lower = ext.lower()
+
+                reasons = []
+
+                # Check for dangerous extension
+                if ext_lower in DANGEROUS_EXTENSIONS:
+                    reasons.append(f"dangerous extension: {ext_lower}")
+
+                # Check for suspicious extension (commonly used to disguise)
+                if ext_lower in SUSPICIOUS_EXTENSIONS:
+                    reasons.append(f"suspicious extension: {ext_lower}")
+
+                # Check for path traversal attempts
+                if ".." in name or name.startswith("/"):
+                    reasons.append("path traversal attempt")
+
+                # Check for double extensions (e.g., file.txt.js, document.pdf.exe)
+                if ext and "." in name.rsplit(".", 1)[0]:
+                    base_ext = name.rsplit(".", 1)[0].rsplit(".", 1)[-1].lower()
+                    if base_ext in {"txt", "csv", "jpg", "png", "pdf", "doc", "xls"}:
+                        reasons.append(f"double extension ({base_ext}->{ext_lower}) — possible disguise")
+
+                # Check for executable-looking names without extension
+                exe_names = {"update", "install", "run", "start", "launch", "execute", "patch", "fix", "loader"}
+                name_base = os.path.splitext(os.path.basename(name))[0].lower()
+                if name_base in exe_names and not ext:
+                    reasons.append(f"executable-sounding name without extension: {name}")
+
+                # Check for hidden/system-looking names
+                if name.startswith(".") or "_" in name and ext_lower in DANGEROUS_EXTENSIONS:
+                    reasons.append(f"hidden/suspicious filename with dangerous extension: {name}")
+
+                if reasons:
+                    suspicious.append({
+                        "entry": name,
+                        "reasons": reasons,
+                        "size": entry.file_size,
+                        "compressed_size": entry.compress_size,
+                    })
+
+    except Exception as e:
+        log("warning", f"Failed to check ZIP entry paths: {e}")
+
+    return suspicious
 
 def _log_unknown_type(data: bytes, filename: str, detected_type: str):
     """Log unknown/uncommon file types for future enhancement."""
@@ -546,6 +614,9 @@ DANGEROUS_EXTENSIONS = {
     ".py", ".rb", ".pl", ".php",
 }
 
+# Extensions that commonly indicate disguise/mismatch (e.g., .TXT stored as .JS)
+SUSPICIOUS_EXTENSIONS = {".js", ".jse", ".ws", ".vbs", ".vbe", ".ps1", ".bat", ".cmd", ".exe", ".scr", ".hta", ".jar", ".py", ".rb", ".php", ".pl"}
+
 TRUST_EXTENSIONS = {
     ".txt", ".csv", ".png", ".jpg", ".jpeg", ".gif", ".bmp",
     ".webp", ".tiff", ".tif", ".pdf", ".mp4", ".avi", ".mp3",
@@ -661,6 +732,24 @@ def rate_file_content(data: bytes, filename: str, detected_type: str) -> tuple[i
                 is_executable = True
                 score_delta += -30  # Heavy penalty for archive containing exe
 
+        # Also check ZIP entry paths for suspicious filenames/dangerous extensions
+        # Note: docx/xlsx/pptx are ZIP-based and may disguise malicious files
+        if detected_type in ("zip", "docx", "xlsx", "pptx") or ext == ".zip":
+            zip_suspicious = _check_zip_entry_paths(data)
+            log("debug", f"ZIP entry check: {len(zip_suspicious)} suspicious entries found")
+            for susp in zip_suspicious:
+                log("debug", f"  Suspicious entry: {susp['entry']} reasons={susp['reasons']}")
+                # Short label for display
+                reasons.append(f"inner_js: .js file in ZIP")
+                # Path traversal or double extension = high risk
+                if any("traversal" in r or "double extension" in r for r in susp["reasons"]):
+                    is_executable = True
+                    score_delta += -20
+                # Mark as executable if contains dangerous/suspicious extension
+                if any("dangerous extension" in r or "suspicious extension" in r for r in susp["reasons"]):
+                    is_executable = True
+                    score_delta += -25
+
     # Log unknown types for enhancement
     _log_unknown_type(data, filename, detected_type)
 
@@ -671,8 +760,10 @@ def rate_file_content(data: bytes, filename: str, detected_type: str) -> tuple[i
         text = ""
 
     if text:
-        # Scan based on detected type
-        if detected_type in RATING_KEYWORDS:
+        # If ZIP contained dangerous entries, skip content-based scanning - ZIP reasons take priority
+        if reasons and any("inner_" in r or "zip_entry" in r for r in reasons):
+            pass  # Keep ZIP-based reasons, don't dilute with content scan
+        elif detected_type in RATING_KEYWORDS:
             delta, found_reasons = _scan_content(text, detected_type)
             score_delta += delta
             reasons.extend(found_reasons)
@@ -736,6 +827,19 @@ def _is_dangerous_content(data: bytes, filename: str, detected_type: str) -> boo
 
     # Content-based check
     rating, _, _ = rate_file_content(data, filename, detected_type)
+
+    # ZIP entry path check — if ZIP contains dangerous entries, mark as dangerous
+    # Note: docx/xlsx/pptx are ZIP-based and may disguise malicious files
+    if detected_type in ("zip", "docx", "xlsx", "pptx") or ext == ".zip":
+        zip_suspicious = _check_zip_entry_paths(data)
+        log("debug", f"_is_dangerous_content: ZIP check found {len(zip_suspicious)} suspicious entries for {filename}")
+        if zip_suspicious:
+            # If any entry has a dangerous/suspicious extension, treat ZIP as dangerous
+            for susp in zip_suspicious:
+                log("debug", f"  entry={susp['entry']} reasons={susp['reasons']}")
+                if any("dangerous extension" in r or "suspicious extension" in r for r in susp["reasons"]):
+                    log("info", f"ZIP {filename}: contains dangerous entry {susp['entry']} — marking as dangerous")
+                    return True
 
     # Safe type check
     is_safe_type = detected_type in SAFE_TYPES or ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".pdf", ".mp4", ".avi", ".mp3", ".wav", ".flac", ".zip", ".rar", ".7z")
@@ -1635,8 +1739,8 @@ def decode_and_write_part(cp: ContentPart, out_dir: str, idx: int, stats: dict):
         sha256 = hashlib.sha256(raw_bytes).hexdigest()
         log("info", f"Part[{idx:02d}] MD5={md5} SHA256={sha256}")
 
-        # Get file extension for display
-        _, file_ext = os.path.splitext(final_name)
+        # Get file extension for display (use original safe_name, not final_name with _defused)
+        _, file_ext = os.path.splitext(safe_name)
 
         stats.setdefault(stat_key, [])
         stats[stat_key].append({
